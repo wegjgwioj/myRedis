@@ -1,7 +1,5 @@
 # MyRedis - Go 语言实现的高性能 Redis 兼容服务器 🚀
 
-[![Go Report Card](https://goreportcard.com/badge/github.com/yourusername/myredis)](https://goreportcard.com/report/github.com/yourusername/myredis)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 MyRedis 是一个基于 Go 语言 (1.21+) 自主研发的轻量级、高性能分布式 KV 存储引擎。它旨在通过**单线程 Actor 模型**复刻 Redis 的核心特性，彻底解决并发编程中的锁竞争痛点，同时提供工业级的持久化与内存管理能力。
 
