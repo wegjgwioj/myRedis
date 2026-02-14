@@ -26,7 +26,7 @@ MyRedis 采用经典的 Reactor 网络模型 + Actor 业务模型：
 ```mermaid
 graph TD
     Client[Redis Client] -->|TCP/RESP| Server[TCP Server/Netpoller]
-    Server -->|CommandRequest| DB[DB Actor (Goroutine)]
+    Server -->|CommandRequest| DB["DB Actor (Goroutine)"]
     
     subgraph "Single-Threaded Core (No Locks)"
         DB -->|Get/Set| Map[Memory Storage]
