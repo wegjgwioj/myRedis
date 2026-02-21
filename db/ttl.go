@@ -1,3 +1,6 @@
+// TTL/过期管理：实现 EXPIRE/TTL/PERSIST/PEXPIREAT 以及惰性+定期删除。
+// 关键点：AOF 使用 PEXPIREAT（绝对过期时间）记录，避免重启“续命”；TTL 查询使用 Peek 不污染淘汰统计。
+// 线程模型：ttlMap 由 Actor 串行维护；定期删除在后台按批扫描，避免长时间阻塞。
 package db
 
 import (
@@ -5,6 +8,12 @@ import (
 	"strconv"
 	"time"
 )
+
+// 本文件实现 TTL 相关命令：
+// - EXPIRE：相对秒（对外命令）
+// - TTL：查询剩余秒数（不应影响 LRU/LFU 统计，因此用 cache.Peek）
+// - PERSIST：取消过期
+// - PEXPIREAT：绝对毫秒时间戳（主要用于 AOF 重放，避免重启续命）
 
 // --- TTL Commands ---
 
@@ -20,20 +29,47 @@ func (db *StandaloneDB) expire(args [][]byte) resp.Reply {
 	}
 
 	// Check if key exists
-	if _, ok := db.cache.Get(key); !ok {
+	if _, ok := db.cache.Peek(key); !ok {
 		return resp.MakeIntReply(0)
+	}
+
+	// Redis: seconds <= 0 相当于立即过期（删除 key）
+	if seconds <= 0 {
+		db.cache.Remove(key)
+		return resp.MakeIntReply(1)
 	}
 
 	// Set TTL
 	db.ttlMap[key] = time.Now().Add(time.Duration(seconds) * time.Second)
 
-	// Log to AOF? (EXPIRE command should be logged)
-	// Handled by `db.background` check (we added "expire" to writeCommands)
-	// But wait, if key doesn't exist, we return 0.
-	// background: `isWriteCommand` -> yes. `!isError(res)` -> yes (IntReply(0) is not error).
-	// So it logs EXPIRE for non-existent key? Redis does not propagate if key missing.
-	// But harmless. Or we can return 0 and rely on slave/AOF consistency.
+	return resp.MakeIntReply(1)
+}
 
+// PEXPIREAT key unix_ms
+// 说明：对齐 Redis AOF 的绝对过期时间语义，用于重放时保持一致性。
+func (db *StandaloneDB) pexpireat(args [][]byte) resp.Reply {
+	if len(args) != 3 {
+		return resp.MakeErrReply("ERR wrong number of arguments for 'pexpireat' command")
+	}
+	key := string(args[1])
+	ms, err := strconv.ParseInt(string(args[2]), 10, 64)
+	if err != nil {
+		return resp.MakeErrReply("ERR value is not an integer or out of range")
+	}
+
+	// key 不存在则返回 0（与 Redis 行为一致）
+	if _, ok := db.cache.Peek(key); !ok {
+		return resp.MakeIntReply(0)
+	}
+
+	expireAt := time.UnixMilli(ms)
+	if !expireAt.After(time.Now()) {
+		// 已经过期，直接删除
+		db.cache.Remove(key)
+		return resp.MakeIntReply(1)
+	}
+
+	db.ttlMap[key] = expireAt
 	return resp.MakeIntReply(1)
 }
 
@@ -44,14 +80,8 @@ func (db *StandaloneDB) ttl(args [][]byte) resp.Reply {
 	}
 	key := string(args[1])
 
-	// Check if key exists (Lazy Expire check embedded in Get?)
-	// No, TTL shouldn't modify LRU usually, but here Get() updates LRU.
-	// Redis TTL command does NOT update LRU.
-	// mygocache/lru/lfu.go `Get` updates usage.
-	// To strictly follow Redis, we might need `Peek`?
-	// Let's assume updating LRU on TTL is acceptable for now.
-
-	if _, ok := db.cache.Get(key); !ok {
+	// TTL 不应影响 LRU/LFU 统计，因此使用 Peek 而不是 Get
+	if _, ok := db.cache.Peek(key); !ok {
 		return resp.MakeIntReply(-2) // Key not exists
 	}
 
@@ -61,16 +91,14 @@ func (db *StandaloneDB) ttl(args [][]byte) resp.Reply {
 		return resp.MakeIntReply(-1) // No expire
 	}
 
-	ttl := time.Until(expireTime).Seconds()
-	if ttl < 0 {
-		// Expired but not deleted yet (Lazy delete should have happened in Get if we implemented it there)
-		// Since we call Get() above, if Get() implements lazy delete, this branch is unreachable.
-		// But let's implement validation here too.
-		db.cache.Remove(key) // This removes from ttlMap via OnEvicted
+	ttl := time.Until(expireTime)
+	if ttl <= 0 {
+		// 已过期但尚未被访问触发惰性删除：这里直接删除并返回 -2
+		db.cache.Remove(key)
 		return resp.MakeIntReply(-2)
 	}
 
-	return resp.MakeIntReply(int64(ttl))
+	return resp.MakeIntReply(int64(ttl.Seconds()))
 }
 
 // PERSIST key
@@ -80,7 +108,8 @@ func (db *StandaloneDB) persist(args [][]byte) resp.Reply {
 	}
 	key := string(args[1])
 
-	if _, ok := db.cache.Get(key); !ok {
+	// PERSIST 不应影响 LRU/LFU 统计，因此使用 Peek
+	if _, ok := db.cache.Peek(key); !ok {
 		return resp.MakeIntReply(0)
 	}
 
@@ -105,20 +134,7 @@ func (db *StandaloneDB) getEntity(key string) (DataEntity, bool) {
 	if expireTime, ok := db.ttlMap[key]; ok {
 		if time.Now().After(expireTime) {
 			db.cache.Remove(key) // Removes from both cache and ttlMap
-			// Propagate DEL to AOF?
-			// db.bg loop only propagates commandRequest.
-			// This internal deletion needs explicit propagation if we want AOF to be perfect.
-			// But if AOF replays, it sets expiry. When replaying Get, it will expire again.
-			// BUT, if we restart server, expire time is lost if we didn't persist current time or relative time.
-			// Redis AOF stores `PEXPIREAT` (absolute time).
-			// Our AOF stores `EXPIRE` (relative seconds).
-			// If restart, relative time resets!
-			// e.g. EXPIRE key 100.
-			// 50s passed. Server restart.
-			// Replay EXPIRE key 100. Key lives for another 100s!
-			// This is a known limitation of simple AOF with relative expiration.
-			// Standard Redis rewrites AOF to PEXPIREAT.
-			// We can live with this for now.
+			// AOF 使用 PEXPIREAT 记录绝对时间，重启时不会“续命”。
 			return nil, false
 		}
 	}

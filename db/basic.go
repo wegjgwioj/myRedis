@@ -1,9 +1,17 @@
+// DB 基础命令实现：包含 PING/GET/SET/DEL 等字符串与键空间常用命令。
+// 说明：所有命令由 db.DB 的 Actor 协程串行执行，避免并发读写 map 的锁竞争与数据竞争。
+// 关键点：写命令需要追加 AOF；删除/覆盖需要同步维护 TTL 与淘汰统计。
 package db
 
 import (
 	"myredis/resp"
 	"time"
 )
+
+// 本文件实现 String 相关命令：SET / GET / DEL
+// 说明：
+// - 数据存储在可插拔 cache（LRU/LFU）中
+// - TTL 由 db.ttlMap 管理（惰性删除 + 定期删除）
 
 // SET key value
 func (db *StandaloneDB) set(args [][]byte) resp.Reply {
@@ -54,12 +62,6 @@ func (db *StandaloneDB) get(args [][]byte) resp.Reply {
 	if expireTime, ok := db.ttlMap[key]; ok {
 		if time.Now().After(expireTime) {
 			db.cache.Remove(key)
-			// AOF DEL propagation is tricky here.
-			// If we are in `execInternal`, we can append DEL to AOF?
-			// Yes, access via `db` struct.
-			if db.aofHandler != nil {
-				db.aofHandler.AddAof([][]byte{[]byte("del"), []byte(key)})
-			}
 			return resp.NullBulkReply
 		}
 	}
@@ -82,7 +84,8 @@ func (db *StandaloneDB) del(args [][]byte) resp.Reply {
 	deleted := 0
 	for i := 1; i < len(args); i++ {
 		key := string(args[i])
-		if _, ok := db.cache.Get(key); ok {
+		// DEL 不需要更新 LRU/LFU 统计，因此使用 Peek
+		if _, ok := db.cache.Peek(key); ok {
 			// Remove from cache (OnEvicted removes from ttlMap)
 			db.cache.Remove(key)
 			deleted++

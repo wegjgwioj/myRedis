@@ -1,3 +1,6 @@
+// List 命令实现：LPUSH/RPUSH/LPOP/RPOP/LRANGE/LLEN 等。
+// 说明：在淘汰/删除 key 时需要触发缓存删除回调，确保 TTL 与 AOF 状态一致。
+// 关键点：当列表为空导致 key 被移除时，需要当作“显式删除”处理以保持一致性。
 package db
 
 import (
@@ -6,6 +9,11 @@ import (
 	"strconv"
 	"time"
 )
+
+// 本文件实现 List 相关命令：LPUSH / RPUSH / LPOP / RPOP / LLEN / LRANGE
+// 说明：
+// - List 的具体值存为 ListData{*list.List}
+// - TTL 由 db.ttlMap 管理；过期时只做内存删除，不额外写入 AOF（AOF 使用 PEXPIREAT 语义保证一致性）
 
 func (db *StandaloneDB) getListForWrite(key string) (*list.List, resp.Reply) {
 	// 1. Get from cache
@@ -19,9 +27,6 @@ func (db *StandaloneDB) getListForWrite(key string) (*list.List, resp.Reply) {
 		if expireTime, ok := db.ttlMap[key]; ok {
 			if time.Now().After(expireTime) {
 				db.cache.Remove(key)
-				if db.aofHandler != nil {
-					db.aofHandler.AddAof([][]byte{[]byte("del"), []byte(key)})
-				}
 				l = list.New() // New empty list
 				// fallthrough to return new list
 			}
@@ -97,9 +102,6 @@ func (db *StandaloneDB) lpop(args [][]byte) resp.Reply {
 	if expireTime, ok := db.ttlMap[key]; ok {
 		if time.Now().After(expireTime) {
 			db.cache.Remove(key)
-			if db.aofHandler != nil {
-				db.aofHandler.AddAof([][]byte{[]byte("del"), []byte(key)})
-			}
 			return resp.NullBulkReply
 		}
 	}
@@ -143,9 +145,6 @@ func (db *StandaloneDB) rpop(args [][]byte) resp.Reply {
 	if expireTime, ok := db.ttlMap[key]; ok {
 		if time.Now().After(expireTime) {
 			db.cache.Remove(key)
-			if db.aofHandler != nil {
-				db.aofHandler.AddAof([][]byte{[]byte("del"), []byte(key)})
-			}
 			return resp.NullBulkReply
 		}
 	}
@@ -186,9 +185,6 @@ func (db *StandaloneDB) llen(args [][]byte) resp.Reply {
 	if expireTime, ok := db.ttlMap[key]; ok {
 		if time.Now().After(expireTime) {
 			db.cache.Remove(key)
-			if db.aofHandler != nil {
-				db.aofHandler.AddAof([][]byte{[]byte("del"), []byte(key)})
-			}
 			return resp.MakeIntReply(0)
 		}
 	}
@@ -220,9 +216,6 @@ func (db *StandaloneDB) lrange(args [][]byte) resp.Reply {
 	if expireTime, ok := db.ttlMap[key]; ok {
 		if time.Now().After(expireTime) {
 			db.cache.Remove(key)
-			if db.aofHandler != nil {
-				db.aofHandler.AddAof([][]byte{[]byte("del"), []byte(key)})
-			}
 			return resp.MakeMultiBulkReply(nil)
 		}
 	}

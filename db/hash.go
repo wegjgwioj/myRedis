@@ -1,9 +1,17 @@
+// Hash 命令实现：HSET/HGET/HGETALL/HDEL 等。
+// 说明：内部数据结构保持简单直接，重点在于命令语义正确 + AOF/TTL/淘汰的协同一致性。
+// 关键点：字段写入/删除要正确落 AOF，并在 key 为空时清理 TTL/缓存条目。
 package db
 
 import (
 	"myredis/resp"
 	"time"
 )
+
+// 本文件实现 Hash 相关命令：HSET / HGET / HGETALL / HDEL
+// 说明：
+// - HashData 使用 map[string][]byte
+// - TTL 由 db.ttlMap 管理；过期只做内存删除，不额外写 AOF（AOF 用 PEXPIREAT 记录绝对时间）
 
 func (db *StandaloneDB) getHash(key string) (HashData, bool) {
 	val, ok := db.cache.Get(key)
@@ -14,9 +22,6 @@ func (db *StandaloneDB) getHash(key string) (HashData, bool) {
 	if expireTime, ok := db.ttlMap[key]; ok {
 		if time.Now().After(expireTime) {
 			db.cache.Remove(key)
-			if db.aofHandler != nil {
-				db.aofHandler.AddAof([][]byte{[]byte("del"), []byte(key)})
-			}
 			return nil, false
 		}
 	}
@@ -54,9 +59,6 @@ func (db *StandaloneDB) hset(args [][]byte) resp.Reply {
 				if expireTime, ok := db.ttlMap[key]; ok {
 					if time.Now().After(expireTime) {
 						db.cache.Remove(key)
-						if db.aofHandler != nil {
-							db.aofHandler.AddAof([][]byte{[]byte("del"), []byte(key)})
-						}
 						// Now it's deleted. Treat as new.
 						goto CreateNew
 					}

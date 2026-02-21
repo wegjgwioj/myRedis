@@ -1,127 +1,88 @@
-# MyRedis - Go 语言实现的高性能 Redis 兼容服务器 🚀
+# MyRedis
 
+MyRedis 是一个用 Go 实现的类 Redis 键值存储服务器，目标是把“协议解析、执行模型、持久化、过期/淘汰、最小分布式闭环”做成可测试、可复现的工程实现。
 
-MyRedis 是一个基于 Go 语言 (1.21+) 自主研发的轻量级、高性能分布式 KV 存储引擎。它旨在通过**单线程 Actor 模型**复刻 Redis 的核心特性，彻底解决并发编程中的锁竞争痛点，同时提供工业级的持久化与内存管理能力。
+## 能力对齐
 
----
+- **分布式键值**：3 节点一致性哈希分片 + 透明转发（静态节点列表）
+- **RESP 协议**：处理 TCP 粘包/拆包，支持管道（Pipeline）
+- **可靠性**：AOF 每秒落盘 + 优雅关闭 + 重启恢复
+- **内存管理**：LRU/LFU 淘汰 + TTL（惰性删除 + 定期删除）
 
-## ✨ 核心特性 (Features)
+> 分布式采用“服务端代理转发”模式：客户端只需连接任意节点，即可读写全量 key。  
+> 本项目不实现 Redis Cluster 的槽位/MOVED/ASK 协议（该体系还涉及 slot 迁移、Gossip、复制与故障转移联动，范围更大）。
 
-*   **完全兼容 RESP 协议**：支持 Redis 客户端（`redis-cli`, `go-redis` 等）无缝连接，支持 Pipeline 批量请求。
-*   **无锁架构 (Lock-Free)**：采用 **Single-Threaded Actor Model**，通过 Go Channel 串行化请求，消除 `sync.RWMutex` 锁竞争，实现极高吞吐。
-*   **多数据结构**：支持 **String**, **List**, **Hash**, **Set** 四大核心数据类型。
-*   **持久化保障**：实现 **AOF (Append Only File)** 持久化，支持 `EverySec` (每秒刷盘) 策略，确保数据安全，支持服务器优雅关闭与重启恢复。
-*   **智能内存管理**：
-    *   **TTL 过期**：支持 `EXPIRE`, `TTL`, `PERSIST` 命令，采用**惰性删除 + 定期删除**双重策略。
-    *   **内存淘汰**：集成 **LRU (Least Recently Used)** 与 **LFU (Least Frequently Used)** 算法，防止内存溢出 (OOM)。
+## 模块说明（按功能拆解）
 
----
+### 1) 网络与协议（TCP + RESP）
 
-## 🏗️ 系统架构 (Architecture)
+- 请求解析为流式：同一连接可连续发送多条命令（管道），并能处理分片到达的输入。
+- 回包严格按请求顺序返回，保证管道场景下客户端可按序读取。
+- 关注点：解析状态机、错误处理、尽量减少多余拷贝。
 
-MyRedis 采用经典的 Reactor 网络模型 + Actor 业务模型：
+### 2) 执行引擎（单线程消息循环 / Actor）
 
-```mermaid
-graph TD
-    Client[Redis Client] -->|TCP/RESP| Server[TCP Server/Netpoller]
-    Server -->|CommandRequest| DB["DB Actor (Goroutine)"]
-    
-    subgraph "Single-Threaded Core (No Locks)"
-        DB -->|Get/Set| Map[Memory Storage]
-        DB -->|Evict| Policy[LRU/LFU Policy]
-        DB -->|Check| TTL[TTL Manager]
-    end
-    
-    DB -->|Persist| AOFChan[AOF Channel]
-    
-    subgraph "Async Persistence"
-        AOFChan -->|Batch Write| Buffer[AOF Buffer]
-        Buffer -->|EverySec| Disk[(AppendOnly.aof)]
-    end
-```
+- 网络连接可以并发，但命令执行在单线程消息循环中串行完成，避免并发读写导致的数据竞争。
+- 优点：更容易把 TTL、淘汰、持久化这些“跨模块一致性”做对；缺点：吞吐上限受单线程影响（可通过多实例扩展）。
 
----
+### 3) 过期（TTL）
 
-## 🚀 快速开始 (Getting Started)
+- 采用“惰性删除 + 定期删除”组合：访问时校验、周期性清理。
+- 过期时间采用绝对时间语义写入持久化日志/快照，避免重启导致“续命”。
 
-### 前置要求
-*   Go 1.21+
-*   Windows/Linux/MacOS
+### 4) 内存淘汰（LRU / LFU）
 
-### 安装与运行
+- 支持按配置选择 LRU 或 LFU；容量受限时自动淘汰。
+- LFU 同频率时按“最近最少使用”退化，保证行为可预测、可测试。
 
-1.  **克隆项目**
-    ```bash
-    git clone https://github.com/yourusername/myredis.git
-    cd myredis
-    ```
+### 5) AOF 持久化（每秒落盘）
 
-2.  **运行服务器**
-    ```bash
-    go run cmd/main.go
-    # 服务器将监听 :6399 端口
-    ```
+- 写命令以追加日志方式持久化，后台按固定频率落盘。
+- 优雅关闭会尽最大努力把队列写完并完成最终落盘，保证“主动关闭不丢数据”。
 
-3.  **使用客户端连接**
-    你可以使用官方 `redis-cli` 或任何兼容 Redis 的客户端：
-    ```bash
-    redis-cli -p 6399
-    
-    127.0.0.1:6399> SET name myredis
-    OK
-    127.0.0.1:6399> GET name
-    "myredis"
-    127.0.0.1:6399> LPUSH mylist a b c
-    (integer) 3
-    127.0.0.1:6399> LRANGE mylist 0 -1
-    1) "c"
-    2) "b"
-    3) "a"
-    ```
+### 6) AOF 重写（压缩历史日志）
 
----
+- 支持将历史日志压缩为“重建当前状态的最小指令集”。
+- 后台重写期间的新写入会被完整保留，避免重写替换导致丢数据。
 
-## 📊 性能压测 (Benchmark)
+### 7) RDB 快照（全量状态）
 
-我们在 **Windows (WSL2)** 环境下使用 `redis-benchmark` 进行了压力测试（100,000 请求，50 并发）：
+- 支持将内存状态写为快照，用于更快加载；与 AOF 互补。
+- 快照中也使用绝对过期时间语义，保证重启一致性。
 
-| 命令 | QPS (Requests/sec) | 平均延迟 (Avg Latency) |
-| :--- | :--- | :--- |
-| **SET** | **28,000+** | **1.8 ms** |
-| **GET** | **26,500+** | **1.8 ms** |
+### 8) 分布式（3 节点分片 + 透明转发）
 
-> **注**：开启 AOF 持久化 (EverySec) 后，性能损耗 **< 5%**，证明了异步 IO 设计的高效性。
+- 一致性哈希决定 key 的归属节点；入口节点负责本地执行或转发到目标节点。
+- 当前对单 key 命令透明转发；对多 key 的 `DEL` 支持跨节点分组与结果聚合。
+- 不包含：动态扩缩容、槽位迁移、复制、故障转移等完整集群能力。
 
----
+### 9) 测试与评估（可复现）
 
-## 📂 项目结构
+- 单元/集成测试覆盖：RESP 拆包/粘包/管道、AOF 刷盘与回放、TTL 语义、LRU/LFU 淘汰语义、分布式透明转发。
+- 提供一键评估脚本：默认在本机启动 3 个节点，分别用 LRU/LFU 跑一轮功能验收，并输出评估报告与日志。
 
-```
-myredis/
-├── cmd/            # 入口文件 (main.go)
-├── server/         # TCP Server & Handler
-├── resp/           # RESP 协议解析器
-├── db/             # 核心数据库实现
-│   ├── basic.go    # String 命令
-│   ├── list.go     # List 命令
-│   ├── hash.go     # Hash 命令
-│   ├── set.go      # Set 命令
-│   ├── ttl.go      # 过期时间管理
-│   └── db.go       # Actor 模型主循环
-└── aof/            # AOF 持久化模块
-```
+## CLI 参数（对外接口）
 
-## 📝 支持命令列表
+- `--addr`：监听地址
+- `--nodes`：节点列表（空表示单机）
+- `--aof`：AOF 文件（空表示关闭）
+- `--rdb`：快照文件（空表示关闭）
+- `--appendfsync`：AOF 刷盘策略（当前仅支持 `everysec`）
+- `--eviction`：淘汰策略（`lru` 或 `lfu`）
+- `--max-bytes`：最大内存（字节）
+- `--vnodes`：一致性哈希虚拟节点数
 
-| 模块 | 命令 |
-| :--- | :--- |
-| **String** | SET, GET, DEL, PING |
-| **List** | LPUSH, RPUSH, LPOP, RPOP, LRANGE, LLEN |
-| **Hash** | HSET, HGET, HGETALL, HDEL |
-| **Set** | SADD, SREM, SCARD, SMEMBERS |
-| **Keys** | EXPIRE, TTL, PERSIST |
+## 支持命令（子集）
 
----
+- String：`PING` `SET` `GET` `DEL`
+- List：`LPUSH` `RPUSH` `LPOP` `RPOP` `LRANGE` `LLEN`
+- Hash：`HSET` `HGET` `HGETALL` `HDEL`
+- Set：`SADD` `SREM` `SCARD` `SMEMBERS`
+- TTL：`EXPIRE` `TTL` `PERSIST` `PEXPIREAT`
+- Admin：`SHUTDOWN`
+- Persistence：`SAVE` `BGSAVE` `REWRITEAOF` `BGREWRITEAOF`
 
-## 📄 License
-MIT License
+## 限制与后续方向
+
+- 分布式当前为静态分片 + 透明转发，未实现 Redis Cluster 的槽位/MOVED/ASK 协议。
+- 高级能力（规划）：复制、故障转移、动态扩缩容、指标与可观测性、更完整命令集等。

@@ -1,9 +1,17 @@
+// LRU 单元测试：验证访问顺序淘汰、Peek 行为、删除原因等。
+// 目标：确保 Get/Peek 的统计语义正确，淘汰顺序稳定。
+// 覆盖：最近最少使用淘汰、Peek 不改变顺序、删除回调原因。
 package lru
 
 import (
 	"reflect"
 	"testing"
 )
+
+// 本文件为 LRU 缓存的单元测试：
+// - 基本读写
+// - 超容量淘汰行为
+// - 回调触发顺序
 
 type String string
 
@@ -38,7 +46,10 @@ func TestRemoveoldest(t *testing.T) {
 
 func TestOnEvicted(t *testing.T) {
 	keys := make([]string, 0)
-	callback := func(key string, value Value) {
+	callback := func(key string, value Value, reason RemoveReason) {
+		if reason != RemoveReasonEvicted {
+			return
+		}
 		keys = append(keys, key)
 	}
 	lru := New(int64(10), callback)

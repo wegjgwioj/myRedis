@@ -1,3 +1,6 @@
+// RESP Reply 序列化：负责把不同类型 reply 编码为字节流返回给客户端。
+// 关键点：尽量减少不必要的拷贝（例如直接写 []byte 而不是频繁 string 转换）。
+// 说明：编码输出必须严格遵守 CRLF 与长度字段规则，否则会导致客户端解析失败。
 package resp
 
 import (
@@ -83,7 +86,13 @@ func (r *BulkReply) ToBytes() []byte {
 	if r.Arg == nil {
 		return []byte("$-1" + CRLF)
 	}
-	return []byte("$" + strconv.Itoa(len(r.Arg)) + CRLF + string(r.Arg) + CRLF)
+	var buf bytes.Buffer
+	buf.WriteString("$")
+	buf.WriteString(strconv.Itoa(len(r.Arg)))
+	buf.WriteString(CRLF)
+	buf.Write(r.Arg)
+	buf.WriteString(CRLF)
+	return buf.Bytes()
 }
 
 // -----------------------------------
@@ -111,7 +120,11 @@ func (r *MultiBulkReply) ToBytes() []byte {
 		if arg == nil {
 			buf.WriteString("$-1" + CRLF)
 		} else {
-			buf.WriteString("$" + strconv.Itoa(len(arg)) + CRLF + string(arg) + CRLF)
+			buf.WriteString("$")
+			buf.WriteString(strconv.Itoa(len(arg)))
+			buf.WriteString(CRLF)
+			buf.Write(arg)
+			buf.WriteString(CRLF)
 		}
 	}
 	return buf.Bytes()

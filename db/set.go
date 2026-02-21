@@ -1,9 +1,17 @@
+// Set 命令实现：SADD/SREM/SCARD/SMEMBERS 等。
+// 说明：该模块与 basic/list/hash 一样，依赖 Actor 串行执行保证并发安全。
+// 关键点：当集合元素删空导致 key 被移除时，要同步清理 TTL 并记录 AOF。
 package db
 
 import (
 	"myredis/resp"
 	"time"
 )
+
+// 本文件实现 Set 相关命令：SADD / SREM / SCARD / SMEMBERS
+// 说明：
+// - SetData 使用 map[string]struct{}
+// - TTL 由 db.ttlMap 管理；过期只做内存删除，不额外写 AOF（AOF 用 PEXPIREAT 保证重启一致性）
 
 func (db *StandaloneDB) getSet(key string) (SetData, bool) {
 	val, ok := db.cache.Get(key)
@@ -14,9 +22,6 @@ func (db *StandaloneDB) getSet(key string) (SetData, bool) {
 	if expireTime, ok := db.ttlMap[key]; ok {
 		if time.Now().After(expireTime) {
 			db.cache.Remove(key)
-			if db.aofHandler != nil {
-				db.aofHandler.AddAof([][]byte{[]byte("del"), []byte(key)})
-			}
 			return nil, false
 		}
 	}
@@ -43,9 +48,6 @@ func (db *StandaloneDB) sadd(args [][]byte) resp.Reply {
 				if expireTime, ok := db.ttlMap[key]; ok {
 					if time.Now().After(expireTime) {
 						db.cache.Remove(key)
-						if db.aofHandler != nil {
-							db.aofHandler.AddAof([][]byte{[]byte("del"), []byte(key)})
-						}
 						goto CreateNewSet
 					}
 				}

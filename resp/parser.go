@@ -1,3 +1,6 @@
+// RESP 解析器：实现 Redis Serialization Protocol 的解析（支持粘包/拆包与 Pipeline）。
+// 关键点：基于 bufio.Reader 读取行与定长 bulk，按前缀分派解析，持续产出 Payload。
+// 输入/输出：输入为 io.Reader（TCP 连接），输出为 Payload channel（逐条命令/回复）。
 package resp
 
 import (
@@ -6,6 +9,11 @@ import (
 	"io"
 	"strconv"
 )
+
+// 本文件实现 RESP 协议解析器（Redis Serialization Protocol）：
+// - 使用状态机/分支解析不同前缀：*（数组）、$（Bulk）、+（状态）、-（错误）、:（整数）
+// - 依赖 bufio.Reader 的 ReadBytes/ReadFull 来天然处理 TCP 粘包/拆包
+// - ParseStream 支持 Pipeline：一个连接连续发送多条命令，会逐条产出 Payload
 
 // Pipeline/Payload
 type Payload struct {

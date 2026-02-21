@@ -1,3 +1,6 @@
+// pool/object_pool：对象池封装（基于 sync.Pool）。
+// 目的：在需要频繁分配小对象时减少 GC 压力，提升热点路径的稳定性。
+// 说明：sync.Pool 的对象可能随 GC 被回收，因此不适合保存必须长期存在的资源。
 package pool
 
 import (

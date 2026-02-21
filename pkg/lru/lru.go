@@ -1,3 +1,6 @@
+// LRU 淘汰实现：Least Recently Used（最近最少使用）。
+// 关键点：Get 会更新访问顺序，Peek 不更新；RemoveReason 透传给上层用于 AOF/TTL 协同。
+// 说明：在内存上限较小、访问模式局部性强时，LRU 通常有较好的命中率与可解释性。
 package lru
 
 import (
@@ -6,6 +9,15 @@ import (
 	"sync"
 	"time"
 )
+
+// 本文件实现 LRU（最近最少使用）缓存：
+// - 通过双向链表维护访问顺序（O(1) MoveToFront）
+// - 通过 map 维护 key -> 节点映射（O(1) 定位）
+// - 通过 maxBytes 控制内存上限，超限时自动淘汰最旧数据
+//
+// 重要说明：
+// - 该结构默认由上层 Actor 串行调用（不保证并发安全）。
+// - 内部 TTL（heap + expirationLoop）目前仅用于可选场景；在本项目 DB 中 TTL 由 db.ttlMap 统一管理。
 
 // Cache 是一个带过期时间支持的 LRU 缓存。它不是并发安全的。
 type Cache struct {
@@ -16,8 +28,8 @@ type Cache struct {
 	// 优先级队列（最小堆），用于过期管理
 	heap    []*pool.HeapItem // 最小堆数组
 	heapMap map[string]int   // 键到堆索引的映射
-	// 当条目被删除时执行的回调函数
-	OnEvicted func(key string, value Value)
+	// 删除回调：用于上层同步清理辅助结构/记录删除原因（淘汰/过期/显式删除等）
+	OnEvicted OnRemoveFunc
 	// 过期协程的停止信号
 	stopChan chan struct{}
 	// 堆操作的互斥锁
@@ -42,7 +54,7 @@ type Value interface {
 // New 创建一个新的缓存实例
 // maxBytes 是缓存的最大字节数
 // onEvicted 是当条目被删除时执行的回调函数
-func New(maxBytes int64, onEvicted func(string, Value)) *Cache {
+func New(maxBytes int64, onEvicted OnRemoveFunc) *Cache {
 	c := &Cache{
 		maxBytes:     maxBytes,
 		ll:           list.New(),
@@ -127,7 +139,7 @@ func (c *Cache) Get(key string) (value Value, ok bool) {
 		// 检查是否过期（惰性过期）
 		if kv.expiresAt > 0 && kv.expiresAt < time.Now().Unix() {
 			// 过期，删除该项
-			c.removeEntry(ele)
+			c.removeEntry(ele, RemoveReasonExpired)
 			return nil, false
 		}
 		// 未过期，移到队首
@@ -137,17 +149,31 @@ func (c *Cache) Get(key string) (value Value, ok bool) {
 	return
 }
 
+// Peek 查找并返回缓存中键对应的值（不更新 LRU 顺序）
+// 适用场景：TTL/INFO 等只想“查看”而不想影响淘汰统计的命令。
+func (c *Cache) Peek(key string) (value Value, ok bool) {
+	if ele, ok := c.cache[key]; ok {
+		kv := ele.Value.(*entry)
+		if kv.expiresAt > 0 && kv.expiresAt < time.Now().Unix() {
+			c.removeEntry(ele, RemoveReasonExpired)
+			return nil, false
+		}
+		return kv.value, true
+	}
+	return nil, false
+}
+
 // RemoveOldest 删除最旧的条目
 func (c *Cache) RemoveOldest() {
 	ele := c.ll.Back()
 	if ele != nil {
-		c.removeEntry(ele)
+		c.removeEntry(ele, RemoveReasonEvicted)
 	}
 }
 
 // removeEntry 从缓存和堆中删除一个条目
 // ele 是要删除的链表元素
-func (c *Cache) removeEntry(ele *list.Element) {
+func (c *Cache) removeEntry(ele *list.Element, reason RemoveReason) {
 	kv := ele.Value.(*entry)
 	key := kv.key
 
@@ -165,7 +191,7 @@ func (c *Cache) removeEntry(ele *list.Element) {
 
 	// 调用删除回调
 	if c.OnEvicted != nil {
-		c.OnEvicted(key, kv.value)
+		c.OnEvicted(key, kv.value, reason)
 	}
 }
 
@@ -284,7 +310,7 @@ func (c *Cache) checkExpiration() {
 
 		// 如果缓存中还存在，删除它
 		if ele, ok := c.cache[key]; ok {
-			c.removeEntry(ele)
+			c.removeEntry(ele, RemoveReasonExpired)
 		}
 
 		c.heapMu.Lock()
@@ -297,10 +323,21 @@ func (c *Cache) Len() int {
 	return c.ll.Len()
 }
 
+// ForEach 遍历缓存中的所有 key/value（不改变 LRU 访问顺序）。
+// 注意：该方法不做并发保护，默认由上层 Actor 串行调用。
+func (c *Cache) ForEach(fn func(key string, value Value) bool) {
+	for key, ele := range c.cache {
+		ent := ele.Value.(*entry)
+		if !fn(key, ent.value) {
+			return
+		}
+	}
+}
+
 // Remove 删除指定键的条目
 func (c *Cache) Remove(key string) {
 	if ele, ok := c.cache[key]; ok {
-		c.removeEntry(ele)
+		c.removeEntry(ele, RemoveReasonDeleted)
 	}
 }
 
@@ -309,7 +346,7 @@ func (c *Cache) Clear() {
 	// 遍历所有条目并删除
 	for key := range c.cache {
 		if ele, ok := c.cache[key]; ok {
-			c.removeEntry(ele)
+			c.removeEntry(ele, RemoveReasonCleared)
 		}
 	}
 }

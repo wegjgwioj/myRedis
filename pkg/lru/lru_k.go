@@ -1,3 +1,6 @@
+// LRU-K 淘汰实现：通过记录最近 K 次访问来估计冷热程度。
+// 说明：当前项目主要用于实验/扩展，统一了删除回调签名便于与 LRU/LFU 共存。
+// 提示：如果后续引入更复杂的热点识别策略，可在此基础上扩展。
 package lru
 
 import (
@@ -6,6 +9,12 @@ import (
 	"sync"
 	"time"
 )
+
+// 本文件实现 LRU-K 缓存（扩展策略，当前主 DB 默认不使用）。
+// 目的：在“近期访问次数不足 K 次的 key 先留在 history 区”来过滤一次性冷数据。
+//
+// 说明：
+// - 该实现包含锁与 sync.Map，主要用于学习/扩展；项目主流程仍是 Actor 串行访问。
 
 // LRUCache 是一个带过期时间支持的 LRU-K 缓存。
 type LRUCache struct {
@@ -22,8 +31,8 @@ type LRUCache struct {
 	heap    []*pool.HeapItem // 最小堆数组
 	heapMap map[string]int   // 键到堆索引的映射
 
-	// 当条目被删除时执行的回调函数
-	OnEvicted func(key string, value Value)
+	// 删除回调（含原因），用于上层同步清理/记录
+	OnEvicted OnRemoveFunc
 
 	// 过期协程的停止信号
 	stopChan chan struct{}
@@ -47,7 +56,7 @@ type lruEntry struct {
 // maxBytes 是缓存的最大字节数
 // k 是 LRU-K 的 K 值
 // onEvicted 是当条目被删除时执行的回调函数
-func NewLRUK(maxBytes int64, k int, onEvicted func(string, Value)) *LRUCache {
+func NewLRUK(maxBytes int64, k int, onEvicted OnRemoveFunc) *LRUCache {
 	if k <= 0 {
 		k = 2 // 默认 K=2
 	}
@@ -184,7 +193,7 @@ func (c *LRUCache) Get(key string) (value Value, ok bool) {
 		// 检查是否过期（惰性过期）
 		if kv.expiresAt > 0 && kv.expiresAt < time.Now().Unix() {
 			// 过期，删除该项
-			c.removeEntry(listEle)
+			c.removeEntry(listEle, RemoveReasonExpired)
 			return nil, false
 		}
 
@@ -221,13 +230,13 @@ func (c *LRUCache) RemoveOldest() {
 
 	ele := c.ll.Back()
 	if ele != nil {
-		c.removeEntry(ele)
+		c.removeEntry(ele, RemoveReasonEvicted)
 	}
 }
 
 // removeEntry 从缓存和堆中删除一个条目
 // ele 是要删除的链表元素
-func (c *LRUCache) removeEntry(ele *list.Element) {
+func (c *LRUCache) removeEntry(ele *list.Element, reason RemoveReason) {
 	kv := ele.Value.(*lruEntry)
 	key := kv.key
 
@@ -248,7 +257,7 @@ func (c *LRUCache) removeEntry(ele *list.Element) {
 
 	// 调用删除回调
 	if c.OnEvicted != nil {
-		c.OnEvicted(key, kv.value)
+		c.OnEvicted(key, kv.value, reason)
 	}
 }
 
@@ -358,7 +367,7 @@ func (c *LRUCache) checkExpiration() {
 		// 如果缓存中还存在，删除它
 		c.mu.Lock()
 		if ele, ok := c.cache.Load(key); ok {
-			c.removeEntry(ele.(*list.Element))
+			c.removeEntry(ele.(*list.Element), RemoveReasonExpired)
 		}
 		c.mu.Unlock()
 
@@ -378,7 +387,7 @@ func (c *LRUCache) Len() int {
 func (c *LRUCache) Remove(key string) {
 	if ele, ok := c.cache.Load(key); ok {
 		c.mu.Lock()
-		c.removeEntry(ele.(*list.Element))
+		c.removeEntry(ele.(*list.Element), RemoveReasonDeleted)
 		c.mu.Unlock()
 	}
 }
@@ -401,7 +410,7 @@ func (c *LRUCache) Clear() {
 	for key := range keyChan {
 		if ele, ok := c.cache.Load(key); ok {
 			c.mu.Lock()
-			c.removeEntry(ele.(*list.Element))
+			c.removeEntry(ele.(*list.Element), RemoveReasonCleared)
 			c.mu.Unlock()
 		}
 	}

@@ -1,7 +1,11 @@
+// server 单元测试：覆盖基本命令、Pipeline 交互、优雅关闭等行为。
+// 目标：确保服务端在并发连接与关闭场景下不 panic、无资源泄漏。
+// 覆盖：SET/GET/DEL、Pipeline、SHUTDOWN。
 package server
 
 import (
 	"bufio"
+	"context"
 	"myredis/db"
 	"net"
 	"strconv"
@@ -25,6 +29,11 @@ func TestServerIntegration(t *testing.T) {
 			t.Logf("Server stopped: %v", err)
 		}
 	}()
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(ctx)
+	})
 	time.Sleep(200 * time.Millisecond)
 
 	conn, err := net.Dial("tcp", addr)
@@ -164,8 +173,9 @@ func TestServerIntegration(t *testing.T) {
 
 		// TTL key -> 1
 		conn.Write([]byte("*2\r\n$3\r\nTTL\r\n$9\r\nexpireKey\r\n"))
-		if n := readInt(); n <= 0 {
-			t.Errorf("TTL expected > 0")
+		// Redis 的 TTL 返回整数秒，可能出现 0（例如剩余 < 1s）
+		if n := readInt(); n < 0 {
+			t.Errorf("TTL expected >= 0")
 		}
 
 		// Wait 1.1s
