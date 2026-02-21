@@ -5,3 +5,12 @@
 *.dylib
 *.test
 *.out
+
+# AOF 与评估产物（运行时生成，不应入库）
+*.aof
+*.rdb
+artifacts/
+
+doc/
+
+myredis.md
